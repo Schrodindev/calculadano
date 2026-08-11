@@ -1,0 +1,16 @@
+{
+  "name": "Contador de Dano & Iniciativa",
+  "version": "1.0.0",
+  "manifest_version": 1,
+  "description": "Iniciativa, rodadas e ranking de dano causado/tankado sincronizado com a mesa.",
+  "author": "Dano Contador",
+  "icon": "/icon.svg",
+  "action": {
+    "title": "Contador de Dano & Iniciativa",
+    "icon": "/icon.svg",
+    "popover": "/",
+    "width": 420,
+    "height": 550
+  },
+  "background_url": "/background.html"
+}
