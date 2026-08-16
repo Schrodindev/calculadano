@@ -151,10 +151,9 @@ function renderInitiative(combatants) {
 
       // Editar iniciativa e remover sao acoes exclusivas do mestre.
       const gmActions =
-        role === "GM"
-          ? `<button class="icon-btn" data-action="edit-initiative" data-id="${c.id}" title="Editar iniciativa">✏️</button>
+         `<button class="icon-btn" data-action="edit-initiative" data-id="${c.id}" title="Editar iniciativa">✏️</button>
              <button class="icon-btn danger" data-action="remove" data-id="${c.id}" title="Remover do combate">✖️</button>`
-          : "";
+        
 
       return `
         <div class="${classes.join(" ")}">
@@ -1103,7 +1102,7 @@ OBR.onReady(async () => {
   await OBR.action.setHeight(550);
 
   role = await OBR.player.getRole();
-  $("gm-controls").hidden = role !== "GM";
+  $("gm-controls").hidden = false
 
   state = await readState();
   bindEvents();

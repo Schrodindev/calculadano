@@ -63,7 +63,7 @@ async function setupContextMenus() {
       {
         icon: "/plus.svg",
         label: "➕ Adicionar à Iniciativa",
-        filter: { ...CHARACTER_FILTER, roles: ["GM"] },
+        filter: { ...CHARACTER_FILTER, roles: ["GM","PLAYER"] },
       },
     ],
     async onClick(context) {
