@@ -73,7 +73,7 @@ async function setupContextMenus() {
       );
 
       if (fresh.length === 0) {
-        await OBR.notification.show("Esses tokens já estão no combate.", "INFO");
+        await OBR.notification.show("Machado de mário é +3 e nao +2 lukas ladrão. Esses tokens já estão no combate.", "INFO");
         return;
       }
 
