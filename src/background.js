@@ -87,7 +87,7 @@ async function setupContextMenus() {
       });
 
       await OBR.notification.show(
-        `${fresh.length} combatente(s) adicionado(s) com iniciativa ${INITIATIVE_DEFAULT}.`,
+        `${fresh.length} combatente(s) adicionado(s) Lukas o machado de mario é +3 ${INITIATIVE_DEFAULT}.`,
         "SUCCESS",
       );
     },
