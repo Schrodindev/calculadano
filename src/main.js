@@ -4,11 +4,13 @@ import {
   METADATA_KEY,
   adjustHp,
   advanceTurn,
-  applyDamage,
+  applyAttack,
   applyHealing,
   clearAc,
   computeMvpRanking,
+  damageFaced,
   hpStatus,
+  previewAttack,
   setAc,
   setAcVisibility,
   trackHp,
@@ -22,10 +24,12 @@ import {
   mutateState,
   normalizeState,
   readState,
+  remainingSlots,
   resetCombat,
   resolveTokenName,
   sortByDamageDealt,
   sortByDamageTanked,
+  sortByEvasion,
   sortByHealing,
   sortByInitiative,
   syncCombatantNames,
@@ -58,6 +62,16 @@ let attackerTouched = false;
 
 /** Modo do diálogo: "damage" ou "heal". */
 let dialogMode = "damage";
+
+/**
+ * Alvos escolhidos no diálogo — mais de um porque dano e cura podem ser em área.
+ * Cada item: `{ id, resistant, missed }`.
+ *
+ * As marcações são POR LANÇAMENTO, e não uma propriedade fixa do combatente:
+ * resistência em RPG é por tipo de dano (o elemental resiste ao fogo e apanha
+ * do machado), e errar é um evento daquele ataque.
+ */
+let dialogTargets = [];
 
 const $ = (id) => document.getElementById(id);
 
@@ -164,6 +178,8 @@ function renderInitiative(combatants) {
               <span class="stat-dealt">⚔️ ${c.damageDealt}</span>
               <span class="stat-tanked">🛡️ ${c.damageTanked}</span>
               <span class="stat-heal">💚 ${c.healingDone}</span>
+              ${c.damageMitigated > 0 ? `<span class="stat-mitigated" title="Dano cortado por resistência">½ ${c.damageMitigated}</span>` : ""}
+              ${c.misses > 0 ? `<span class="stat-miss" title="Golpes esquivados">💨 ${c.misses}</span>` : ""}
             </div>
           </div>
           <div class="card-actions">
@@ -180,32 +196,106 @@ function renderInitiative(combatants) {
 function renderSelectors(combatants) {
   const order = sortByInitiative(combatants);
 
-  for (const [elementId, placeholder] of [
-    ["select-attacker", "— quem atacou —"],
-    ["select-victim", "— quem levou —"],
-  ]) {
-    const select = $(elementId);
-    const previous = select.value;
+  const optionsFor = (list) =>
+    list
+      .map(
+        (c) =>
+          `<option value="${c.id}">${escapeHtml(c.name)}${c.isGMOnly ? " 🕵️" : ""}</option>`,
+      )
+      .join("");
 
-    select.innerHTML =
-      `<option value="">${placeholder}</option>` +
-      order
-        .map(
-          (c) =>
-            `<option value="${c.id}">${escapeHtml(c.name)}${c.isGMOnly ? " 🕵️" : ""}</option>`,
-        )
-        .join("");
-
-    // Restaura a selecao anterior; se o combatente sumiu, cai no placeholder.
-    select.value = order.some((c) => c.id === previous) ? previous : "";
-  }
+  // --- Quem atacou: uma escolha só, preservada entre re-renders --------------
+  const attacker = $("select-attacker");
+  const previous = attacker.value;
+  attacker.innerHTML = `<option value="">— quem atacou —</option>${optionsFor(order)}`;
+  attacker.value = order.some((c) => c.id === previous) ? previous : "";
 
   // Atalho: enquanto o usuario nao escolher manualmente, o atacante sugerido e
   // quem esta no turno.
-  const attacker = $("select-attacker");
   if (!attackerTouched && order.some((c) => c.id === state.activeTokenId)) {
     attacker.value = state.activeTokenId;
   }
+
+  // --- Quem levou: um seletor que ADICIONA à lista de alvos ------------------
+  // Combatente que saiu do combate no meio do preenchimento sai da lista junto.
+  dialogTargets = dialogTargets.filter((t) => order.some((c) => c.id === t.id));
+
+  const available = order.filter((c) => !dialogTargets.some((t) => t.id === c.id));
+  const picker = $("select-victim");
+  picker.innerHTML =
+    `<option value="">${available.length ? "— adicionar alvo —" : "— todos já são alvos —"}</option>` +
+    optionsFor(available);
+  picker.value = "";
+  picker.disabled = available.length === 0;
+
+  renderTargets();
+}
+
+/**
+ * A lista de alvos do lançamento.
+ *
+ * Cada linha traz o resultado JÁ CALCULADO do golpe naquele alvo ("50 → 25"),
+ * lido da mesma função que grava o placar. O mestre confere o efeito da
+ * resistência antes de confirmar, sem precisar fazer a conta de cabeça.
+ */
+function renderTargets() {
+  const container = $("target-list");
+  const isHeal = dialogMode === "heal";
+
+  if (dialogTargets.length === 0) {
+    container.innerHTML = `<div class="target-empty">
+        ${isHeal ? "Nenhum alvo — a cura conta só para quem lançou." : "Nenhum alvo — o dano conta só para quem atacou (dano ambiental)."}
+      </div>`;
+    return;
+  }
+
+  const amount = Number($("input-damage").value);
+  const hasAmount = Number.isFinite(amount) && amount !== 0;
+  const outcomes = previewAttack(dialogTargets, hasAmount ? amount : 0).perTarget;
+
+  container.innerHTML = dialogTargets
+    .map((target, index) => {
+      const combatant = state.combatants.find((c) => c.id === target.id);
+      const name = combatant ? combatant.name : "—";
+      const outcome = outcomes[index];
+
+      // Na cura não existe resistência nem esquiva: todo mundo recebe o valor cheio.
+      const flags = isHeal
+        ? ""
+        : `<button class="target-flag ${target.resistant ? "on" : ""}" data-flag="resistant" data-id="${target.id}"
+                   title="Resistência: este alvo recebe metade do dano">½ Resist.</button>
+           <button class="target-flag miss ${target.missed ? "on" : ""}" data-flag="missed" data-id="${target.id}"
+                   title="Errou: o alvo esquivou e não recebe dano">💨 Errou</button>`;
+
+      const effect = isHeal
+        ? hasAmount
+          ? `<span class="target-hit heal">+${amount}</span>`
+          : ""
+        : hasAmount
+          ? target.missed
+            ? `<span class="target-hit missed">errou</span>`
+            : `<span class="target-hit ${target.resistant ? "cut" : ""}">${
+                target.resistant ? `${amount} → ${outcome.landed}` : outcome.landed
+              }</span>`
+          : "";
+
+      return `<div class="target-row ${target.missed ? "is-missed" : ""}">
+                <span class="target-name">${escapeHtml(name)}</span>
+                ${effect}
+                ${flags}
+                <button class="target-remove" data-remove="${target.id}" title="Tirar da lista">✖️</button>
+              </div>`;
+    })
+    .join("");
+}
+
+/** Adiciona um combatente à lista de alvos (ignora repetido e id inexistente). */
+function addTarget(id) {
+  if (!id || dialogTargets.some((t) => t.id === id)) return;
+  if (!visibleTo(state, role).some((c) => c.id === id)) return;
+
+  dialogTargets.push({ id, resistant: false, missed: false });
+  renderSelectors(visibleTo(state, role));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -361,18 +451,34 @@ const CATEGORY_UI = {
   },
   tank: {
     icon: "🛡️",
-    header: "Tankado",
+    header: "Recebido",
     empty: "Ninguém apanhou ainda.<br />O paredão está limpo.",
+  },
+  evasion: {
+    icon: "💨",
+    header: "Esquivas",
+    empty: "Nenhuma esquiva registrada.",
   },
   heal: {
     icon: "💚",
     header: "Cura",
     empty: "Nenhuma cura registrada.<br />Use o modo <b>💚 Cura</b> ao registrar.",
   },
-  score: { icon: "👑", header: "Pontos", empty: "Nada registrado." },
+  score: { icon: "👑", header: "Índice", empty: "Nada registrado." },
 };
 
 const MEDALS = ["🥇", "🥈", "🥉"];
+
+/**
+ * Quem aparece na tabela de cada categoria.
+ *
+ * O tank é o caso especial: quem só esquivou tem `damageTanked` zerado e ainda
+ * assim precisa aparecer — foi alvo, e sair ileso é justamente o mérito.
+ */
+function rankingFilter(field, kind) {
+  if (kind !== "tank") return (c) => c[field] > 0;
+  return (c) => damageFaced(c) > 0 || c.misses > 0;
+}
 
 /**
  * Monta a tabela de um ranking. Só entra quem tem valor maior que zero — uma
@@ -383,21 +489,31 @@ const MEDALS = ["🥇", "🥈", "🥉"];
  * @param {"damage"|"tank"|"heal"} kind
  */
 function rankingTableHtml(ordered, field, kind) {
-  const scored = ordered.filter((c) => c[field] > 0);
+  const scored = ordered.filter(rankingFilter(field, kind));
   if (scored.length === 0) return "";
 
-  const max = scored[0][field] || 1;
+  const isTank = kind === "tank";
   const { header } = CATEGORY_UI[kind];
+
+  // No tank as duas barras dividem a MESMA escala (o maior "recebido +
+  // mitigado" da mesa), então o segmento sólido continua caindo linha a linha,
+  // acompanhando a ordenação, e a soma nunca estoura a largura da célula.
+  const max = isTank
+    ? Math.max(...scored.map((c) => c.damageTanked + c.damageMitigated), 1)
+    : scored[0][field] || 1;
 
   const rows = scored
     .map((c, index) => {
       const position = index + 1;
-      const percent = Math.round((c[field] / max) * 100);
+      const bar = isTank ? tankBarHtml(c, max) : plainBarHtml(c[field], max);
+      const detail = isTank ? tankDetailHtml(c) : "";
+
       return `<tr class="pos-${position}">
                 <td class="col-pos">${MEDALS[index] ?? `${position}º`}</td>
-                <td class="col-name bar-cell">
-                  <div class="bar" style="width:${percent}%"></div>
+                <td class="col-name bar-cell"${isTank ? ' style="white-space:normal"' : ""}>
+                  ${bar}
                   <span>${escapeHtml(c.name)}</span>
+                  ${detail}
                 </td>
                 <td class="col-value">${c[field]}</td>
               </tr>`;
@@ -409,8 +525,61 @@ function rankingTableHtml(ordered, field, kind) {
               <tr><th class="col-pos">#</th><th>Combatente</th><th class="col-value">${header}</th></tr>
             </thead>
             <tbody>${rows}</tbody>
-          </table>`;
+          </table>
+          ${isTank ? TANK_LEGEND : ""}`;
 }
+
+function plainBarHtml(value, max) {
+  return `<div class="bar" style="width:${Math.round((value / max) * 100)}%"></div>`;
+}
+
+/**
+ * Barra dupla do paredão: o que o combatente levou de fato (sólido) e o que a
+ * resistência cortou antes de chegar na vida (hachurado, encostado no fim da
+ * primeira). Juntas mostram a ameaça que veio na direção dele.
+ */
+function tankBarHtml(combatant, max) {
+  const received = Math.round((combatant.damageTanked / max) * 100);
+  const mitigated = Math.round((combatant.damageMitigated / max) * 100);
+
+  // Sem mitigação o segundo segmento nem existe — assim o sólido é o último
+  // filho e fecha as duas pontas arredondadas, como qualquer outra barra.
+  const cut =
+    combatant.damageMitigated > 0
+      ? `<div class="bar-seg mitigated" style="width:${mitigated}%"></div>`
+      : "";
+
+  return `<div class="bar-stack">
+            <div class="bar-seg received" style="width:${received}%"></div>
+            ${cut}
+          </div>`;
+}
+
+/** Números por extenso da linha do tank — o que a barra desenha, em texto. */
+function tankDetailHtml(combatant) {
+  const attacks = combatant.hitsTaken + combatant.misses;
+  const chips = [`<span class="chip">🛡️ ${combatant.damageTanked} recebido</span>`];
+
+  if (combatant.damageMitigated > 0) {
+    chips.push(`<span class="chip">½ ${combatant.damageMitigated} mitigado</span>`);
+  }
+  if (combatant.misses > 0) {
+    chips.push(
+      `<span class="chip">💨 ${combatant.misses} esquiva${combatant.misses > 1 ? "s" : ""} de ${attacks}</span>`,
+    );
+  }
+  if (combatant.damageDodged > 0) {
+    chips.push(`<span class="chip">🚫 ${combatant.damageDodged} evitado</span>`);
+  }
+
+  return `<div class="chip-row">${chips.join("")}</div>`;
+}
+
+/** Legenda da barra dupla — sem ela, o hachurado é só um enfeite. */
+const TANK_LEGEND = `<div class="bar-legend">
+    <span><i class="swatch received"></i> Dano recebido de fato</span>
+    <span><i class="swatch mitigated"></i> Mitigado por resistência</span>
+  </div>`;
 
 /** Renderiza a tabela de um ranking numa das abas. */
 function renderRankingTable(containerId, ordered, field, kind) {
@@ -457,23 +626,21 @@ async function handleSetTurn(id) {
 function openAttackDialog(victimId = null) {
   // A cada abertura o atacante volta a ser sugerido como quem está no turno.
   attackerTouched = false;
+  dialogTargets = [];
   setDialogMode("damage");
-  render();
-
-  const attacker = $("select-attacker");
-  const victim = $("select-victim");
-
-  if (victimId && [...victim.options].some((option) => option.value === victimId)) {
-    victim.value = victimId;
-  }
 
   $("input-damage").value = "";
   clearQuickSelection();
 
+  // A vítima pré-selecionada (menu de contexto) entra como primeiro alvo; os
+  // demais o mestre acrescenta pelo seletor.
+  if (victimId) dialogTargets.push({ id: victimId, resistant: false, missed: false });
+  render();
+
   $("attack-overlay").hidden = false;
 
   // Se a vítima já veio pronta, o foco vai direto para o campo de dano.
-  (victim.value ? $("input-damage") : attacker).focus();
+  (dialogTargets.length ? $("input-damage") : $("select-attacker")).focus();
 }
 
 /** Troca entre registrar dano e registrar cura, reescrevendo os rótulos. */
@@ -495,6 +662,9 @@ function setDialogMode(mode) {
   $("hint-heal").hidden = !isHeal;
 
   $("btn-apply-damage").textContent = isHeal ? "💚 Confirmar" : "💥 Confirmar";
+
+  // As marcações de resistência/erro só existem no modo dano.
+  renderTargets();
 }
 
 function closeAttackDialog() {
@@ -513,12 +683,14 @@ function pickQuickDamage(value) {
   clearQuickSelection();
   const button = document.querySelector(`[data-quick="${value}"]`);
   if (button) button.classList.add("selected");
+  // A prévia por alvo acompanha o novo valor.
+  renderTargets();
 }
 
 async function handleApplyDamage() {
   const isHeal = dialogMode === "heal";
   const sourceId = $("select-attacker").value;
-  const targetId = $("select-victim").value;
+  const targets = [...dialogTargets];
   const amount = Number($("input-damage").value);
 
   if (!Number.isFinite(amount) || amount === 0) {
@@ -535,27 +707,53 @@ async function handleApplyDamage() {
       await OBR.notification.show("Escolha quem realizou a cura.", "WARNING");
       return;
     }
-    // O alvo não ganha mérito, mas recupera vida se estiver sob controle.
-    await mutateState((draft) => applyHealing(draft, sourceId, targetId, amount));
+    // Os alvos não ganham mérito, mas recuperam vida se estiverem sob controle.
+    await mutateState((draft) =>
+      applyHealing(draft, sourceId, targets.map((t) => t.id), amount),
+    );
   } else {
-    if (!sourceId && !targetId) {
+    if (!sourceId && targets.length === 0) {
       await OBR.notification.show("Escolha ao menos um atacante ou uma vítima.", "WARNING");
       return;
     }
-    // Escrita unica: credita damageDealt no atacante e damageTanked na vitima.
-    await mutateState((draft) => applyDamage(draft, sourceId, targetId, amount));
+    // Escrita unica: credita o dano efetivo no atacante e distribui entre os alvos.
+    await mutateState((draft) => applyAttack(draft, sourceId, targets, amount));
   }
 
   closeAttackDialog();
+  await OBR.notification.show(attackSummary(isHeal, sourceId, targets, amount), "SUCCESS");
+}
 
-  const sourceName = state.combatants.find((c) => c.id === sourceId)?.name;
-  const targetName = state.combatants.find((c) => c.id === targetId)?.name;
-  await OBR.notification.show(
-    isHeal
-      ? `💚 ${sourceName} curou ${amount}${targetName ? ` em ${targetName}` : ""}.`
-      : `${sourceName ?? "Dano ambiental"} → ${targetName ?? "sem alvo"}: ${amount}`,
-    "SUCCESS",
-  );
+/** Uma linha de texto contando o que acabou de acontecer, em área ou não. */
+function attackSummary(isHeal, sourceId, targets, amount) {
+  const nameOf = (id) => state.combatants.find((c) => c.id === id)?.name;
+  const sourceName = nameOf(sourceId);
+
+  const targetLabel =
+    targets.length === 0
+      ? isHeal
+        ? ""
+        : "sem alvo"
+      : targets.length === 1
+        ? (nameOf(targets[0].id) ?? "alvo")
+        : `${targets.length} alvos`;
+
+  if (isHeal) {
+    const total = amount * Math.max(1, targets.length);
+    return `💚 ${sourceName} curou ${amount}${targetLabel ? ` em ${targetLabel}` : ""}${
+      targets.length > 1 ? ` (${total} no total)` : ""
+    }.`;
+  }
+
+  const result = previewAttack(targets, amount);
+  const extras = [];
+  if (result.mitigated > 0) extras.push(`½ ${result.mitigated} mitigado`);
+  if (result.misses > 0) extras.push(`💨 ${result.misses} esquiva${result.misses > 1 ? "s" : ""}`);
+
+  const dealt = targets.length === 0 ? amount : result.dealt;
+  return `${sourceName ?? "Dano ambiental"} → ${targetLabel}: ${dealt} de dano${
+    extras.length ? ` · ${extras.join(" · ")}` : ""
+  }`;
 }
 
 async function handleAddSelected() {
@@ -574,11 +772,30 @@ async function handleAddSelected() {
   const isGMOnly = $("check-gm-only").checked;
 
   const current = await readState();
-  const fresh = items.filter((item) => !current.combatants.some((c) => c.id === item.id));
+  const candidates = items.filter((item) => !current.combatants.some((c) => c.id === item.id));
 
-  if (fresh.length === 0) {
+  if (candidates.length === 0) {
     await OBR.notification.show("Esses tokens já estão no combate.", "INFO");
     return;
+  }
+
+  // A fila tem teto (a metadata da sala é limitada). Melhor dizer o que ficou
+  // de fora do que gravar e deixar a normalização cortar em silêncio.
+  const slots = remainingSlots(current);
+  if (slots === 0) {
+    await OBR.notification.show(
+      "A fila de iniciativa está cheia. Remova alguém antes de adicionar.",
+      "ERROR",
+    );
+    return;
+  }
+
+  const fresh = candidates.slice(0, slots);
+  if (fresh.length < candidates.length) {
+    await OBR.notification.show(
+      `Só cabiam mais ${slots} na fila — ${candidates.length - fresh.length} token(s) ficaram de fora.`,
+      "WARNING",
+    );
   }
 
   // Uma unica rolagem de iniciativa por lote mantem o fluxo rapido; o mestre
@@ -800,8 +1017,9 @@ async function handleEndCombat() {
 /**
  * Monta e exibe o relatorio final a partir de um retrato do combate.
  *
- * Ordem da tela: primeiro as TABELAS completas de cada categoria, e so no fim
- * os tres MVPs — a leitura sobe dos numeros para a coroacao.
+ * Ordem da tela: primeiro as TABELAS completas de cada categoria, depois os
+ * destaques de cada frente e, no fim, o MVP geral com o indice que o elegeu —
+ * a leitura sobe dos numeros para a coroacao.
  */
 function showBattleReport(snapshot) {
   const combatants = visibleTo(snapshot, role);
@@ -809,15 +1027,21 @@ function showBattleReport(snapshot) {
   const byDamage = sortByDamageDealt(combatants);
   const byTank = sortByDamageTanked(combatants);
   const byHeal = sortByHealing(combatants);
+  const byEvasion = sortByEvasion(combatants);
 
-  const totalDamage = combatants.reduce((sum, c) => sum + c.damageDealt, 0);
-  const totalTanked = combatants.reduce((sum, c) => sum + c.damageTanked, 0);
-  const totalHealed = combatants.reduce((sum, c) => sum + c.healingDone, 0);
+  const total = (field) => combatants.reduce((sum, c) => sum + c[field], 0);
+
+  const totalDamage = total("damageDealt");
+  const totalTanked = total("damageTanked");
+  const totalHealed = total("healingDone");
+  const totalMitigated = total("damageMitigated");
+  const totalMisses = total("misses");
 
   // Um MVP por categoria: simplesmente quem lidera cada tabela.
   const mvps = [
     { kind: "damage", label: "MVP de Dano", unit: "dano", leader: byDamage[0], field: "damageDealt" },
     { kind: "tank", label: "MVP de Tank", unit: "tankado", leader: byTank[0], field: "damageTanked" },
+    { kind: "evasion", label: "MVP de Evasão", unit: "esquivas", leader: byEvasion[0], field: "misses" },
     { kind: "heal", label: "MVP de Cura", unit: "cura", leader: byHeal[0], field: "healingDone" },
   ];
 
@@ -826,15 +1050,17 @@ function showBattleReport(snapshot) {
       <div class="total-tile"><strong>${snapshot.round}</strong><small>rodadas</small></div>
       <div class="total-tile"><strong style="color:var(--accent)">${totalDamage}</strong><small>dano</small></div>
       <div class="total-tile"><strong style="color:var(--shield)">${totalTanked}</strong><small>tankado</small></div>
+      <div class="total-tile"><strong style="color:var(--shield)">${totalMitigated}</strong><small>mitigado</small></div>
+      <div class="total-tile"><strong style="color:var(--gold)">${totalMisses}</strong><small>esquivas</small></div>
       <div class="total-tile"><strong style="color:var(--success)">${totalHealed}</strong><small>cura</small></div>
     </div>
 
     ${reportSection("⚔️ Dano causado", byDamage, "damageDealt", "damage")}
-    ${reportSection("🛡️ Dano tankado", byTank, "damageTanked", "tank")}
+    ${reportSection("🛡️ Dano tankado e evitado", byTank, "damageTanked", "tank")}
     ${reportSection("💚 Cura realizada", byHeal, "healingDone", "heal")}
 
     <div class="report-section">
-      <div class="section-title">👑 Os MVPs da batalha</div>
+      <div class="section-title">🏅 Os melhores de cada frente</div>
       <div class="mvp-grid">
         ${mvps.map(mvpCardHtml).join("")}
       </div>
@@ -882,48 +1108,99 @@ function reportSection(title, ordered, field, kind) {
 }
 
 /**
- * Placar geral de contribuição — a soma ponderada das três categorias.
- * Complementa os MVPs: mostra quem ajudou em mais de uma frente.
- * Regra em docs/pontuacao-mvp.md.
+ * A coroação: o MVP da batalha e o Índice de Contribuição que o elegeu.
+ *
+ * O índice vai de 0 a 100 e mede desempenho RELATIVO ao melhor da mesa em cada
+ * pilar — ofensiva, muralha, evasão, suporte e eficiência. Regra completa em
+ * docs/pontuacao-mvp.md.
  */
 function contributionSection(combatants) {
-  const ranking = computeMvpRanking(combatants).filter((entry) => entry.score > 0);
-  if (ranking.length === 0) return "";
+  const { ranking, pillars } = computeMvpRanking(combatants);
+  const scored = ranking.filter((entry) => entry.score > 0);
+  if (scored.length === 0) return "";
 
-  const max = ranking[0].score || 1;
-
-  const rows = ranking
+  const rows = scored
     .map((entry, index) => {
       const position = index + 1;
-      const percent = Math.round((entry.score / max) * 100);
       const chips = entry.breakdown
-        .map((part) => `<span class="chip">${part.icon} ${part.position}º · ${part.points}</span>`)
+        .map(
+          (part) =>
+            `<span class="chip" title="${part.label}: ${Math.round(part.share * 100)}% do melhor da mesa">
+               ${part.icon} ${part.points.toFixed(1)}
+             </span>`,
+        )
         .join("");
 
+      // A barra usa o próprio índice como largura: ela mede o quanto o
+      // combatente chegou perto do desempenho perfeito, não do primeiro lugar.
       return `<tr class="pos-${position}">
                 <td class="col-pos">${MEDALS[index] ?? `${position}º`}</td>
                 <td class="col-name bar-cell" style="white-space:normal">
-                  <div class="bar" style="width:${percent}%"></div>
+                  <div class="bar" style="width:${Math.round(entry.score)}%"></div>
                   <span>${escapeHtml(entry.combatant.name)}</span>
                   <div class="chip-row">${chips}</div>
                 </td>
-                <td class="col-value">${entry.score}</td>
+                <td class="col-value">${entry.score.toFixed(1)}</td>
               </tr>`;
     })
     .join("");
 
-  return `<div class="report-section">
-            <div class="section-title">📊 Contribuição geral</div>
+  const weights = pillars
+    .map(
+      (pillar) =>
+        `<span class="chip" title="${pillar.hint}">${pillar.icon} ${pillar.label} ${Math.round(pillar.effectiveWeight)}</span>`,
+    )
+    .join("");
+
+  // Pilares em que ninguém pontuou saem da conta e devolvem seu peso aos
+  // outros — é o que impede uma mesa sem curandeiro de carregar pontos mortos.
+  const dropped = MVP_PILLAR_COUNT - pillars.length;
+
+  return `${mvpBannerHtml(scored[0])}
+          <div class="report-section">
+            <div class="section-title">📊 Índice de contribuição</div>
             <table class="rank-table score">
               <thead>
-                <tr><th class="col-pos">#</th><th>Combatente</th><th class="col-value">Pontos</th></tr>
+                <tr><th class="col-pos">#</th><th>Combatente</th><th class="col-value">Índice</th></tr>
               </thead>
               <tbody>${rows}</tbody>
             </table>
+            <div class="chip-row" style="margin-top:7px">${weights}</div>
             <p class="dialog-hint">
-              Pódio de cada categoria vale 5 / 3 / 1 ponto, multiplicado pelo peso:
-              <b>dano ×3</b>, <b>tank ×2</b>, <b>cura ×1</b>.
+              Cada pilar vira uma nota comparada ao <b>melhor da mesa</b> e é
+              multiplicada pelo peso acima — 100 seria liderar tudo ao mesmo tempo.
+              ${
+                dropped > 0
+                  ? `<br />${dropped} pilar${dropped > 1 ? "es" : ""} sem registro nesta batalha saiu da conta, e o peso dele foi redistribuído.`
+                  : ""
+              }
             </p>
+          </div>`;
+}
+
+/** Quantos pilares existem no total — para avisar quantos saíram da conta. */
+const MVP_PILLAR_COUNT = 5;
+
+/** O pódio em uma linha só: quem levou a batalha e por quê. */
+function mvpBannerHtml(winner) {
+  const top = winner.breakdown
+    .slice(0, 2)
+    .map((part) => `${part.icon} ${part.label}`)
+    .join(" · ");
+
+  return `<div class="report-section">
+            <div class="section-title">👑 MVP da batalha</div>
+            <div class="mvp-banner">
+              <div class="mvp-crown">👑</div>
+              <div class="mvp-info">
+                <div class="mvp-name">${escapeHtml(winner.combatant.name)}</div>
+                <div class="mvp-why">${top || "Participação registrada"}</div>
+              </div>
+              <div>
+                <div class="mvp-value">${winner.score.toFixed(1)}</div>
+                <small class="mvp-unit">índice</small>
+              </div>
+            </div>
           </div>`;
 }
 
@@ -998,11 +1275,45 @@ function bindEvents() {
   $("select-attacker").addEventListener("change", () => {
     attackerTouched = true;
   });
+
+  // O seletor de vítima é um "adicionar": escolher alguém empurra para a lista
+  // de alvos e volta ao placeholder, pronto para o próximo alvo da área.
+  $("select-victim").addEventListener("change", (event) => {
+    addTarget(event.target.value);
+  });
+
+  // Marcações por alvo (resistência / erro) e remoção da lista.
+  $("target-list").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-flag], [data-remove]");
+    if (!button) return;
+
+    const { flag, id, remove } = button.dataset;
+
+    if (remove) {
+      dialogTargets = dialogTargets.filter((t) => t.id !== remove);
+      renderSelectors(visibleTo(state, role));
+      return;
+    }
+
+    const target = dialogTargets.find((t) => t.id === id);
+    if (!target) return;
+
+    target[flag] = !target[flag];
+    // Errar e resistir são excludentes: um golpe que não encostou não tem
+    // metade para cortar.
+    if (target[flag]) target[flag === "missed" ? "resistant" : "missed"] = false;
+
+    renderTargets();
+  });
+
   $("btn-apply-damage").addEventListener("click", handleApplyDamage);
   $("input-damage").addEventListener("keydown", (event) => {
     if (event.key === "Enter") handleApplyDamage();
   });
-  $("input-damage").addEventListener("input", clearQuickSelection);
+  $("input-damage").addEventListener("input", () => {
+    clearQuickSelection();
+    renderTargets();
+  });
 
   for (const button of document.querySelectorAll("[data-quick]")) {
     button.addEventListener("click", () => pickQuickDamage(Number(button.dataset.quick)));
@@ -1083,12 +1394,11 @@ async function consumeContextMenuTarget() {
   const targetId = await consumePendingTarget();
   if (!targetId) return;
 
-  const select = $("select-victim");
-  if (![...select.options].some((option) => option.value === targetId)) return;
+  // O token pode nem estar na iniciativa (ou estar oculto para quem clicou).
+  if (!visibleTo(state, role).some((c) => c.id === targetId)) return;
 
-  select.value = targetId;
   switchTab("initiative");
-  $("input-damage").focus();
+  openAttackDialog(targetId);
 }
 
 /* ========================================================================== */

@@ -2,7 +2,7 @@
 
 Painel de combate sincronizado para toda a mesa: ordem de iniciativa, contagem
 de rodadas, foco automático de câmera e ranking de **dano causado**, **dano
-tankado** e **cura** — coroando um MVP ponderado no fim da batalha.
+tankado**, **evasão** e **cura** — coroando um MVP ponderado no fim da batalha.
 
 ## Estrutura
 
@@ -74,6 +74,10 @@ Todo o estado vive na metadata da sala, sob a chave `extensao-combat/room-state`
       "initiative": 18,
       "damageDealt": 145,
       "damageTanked": 80,
+      "damageMitigated": 30,
+      "damageDodged": 25,
+      "misses": 2,
+      "hitsTaken": 6,
       "healingDone": 0,
       "isGMOnly": false,
       "hp": null,
@@ -85,7 +89,6 @@ Todo o estado vive na metadata da sala, sob a chave `extensao-combat/room-state`
       "initiative": 12,
       "damageDealt": 80,
       "damageTanked": 145,
-      "healingDone": 0,
       "isGMOnly": true,
       "hp": { "current": 32, "max": 60 },
       "ac": { "value": 16, "visible": false }
@@ -94,12 +97,27 @@ Todo o estado vive na metadata da sala, sob a chave `extensao-combat/room-state`
 }
 ```
 
+A ficha defensiva tem quatro contadores porque "levou dano" e "foi alvo" não são
+a mesma coisa:
+
+| Campo | O que guarda |
+| --- | --- |
+| `damageTanked` | o que encostou de fato e desceu da vida |
+| `damageMitigated` | o que a resistência cortou antes de chegar lá |
+| `damageDodged` | o que teria acertado, se não fosse a esquiva |
+| `misses` / `hitsTaken` | quantos golpes erraram e quantos acertaram |
+
 `hp: null` significa "sem controle de vida" — o caso da maioria dos heróis.
 `ac: null` significa "CA não anotada"; `visible: false` é a CA que só o mestre vê.
 
 `OBR.room.onMetadataChange` re-renderiza o painel de todo mundo a cada escrita.
-A metadata da sala tem limite de **16 kB**, então o estado é normalizado antes
-de gravar (máx. 60 combatentes, nomes truncados em 40 caracteres).
+A metadata da sala tem limite de **16 kB** — e esse teto é compartilhado com
+qualquer outra extensão instalada na sala. Por isso o estado é normalizado antes
+de gravar (máx. 45 combatentes, nomes truncados em 40 caracteres) e **compactado**:
+contador zerado, `isGMOnly: false`, `hp: null` e `ac: null` simplesmente não vão
+para a metadata, e `normalizeState` os reconstrói na leitura. Repare no segundo
+combatente do exemplo acima — sem cura nem esquiva, esses campos somem. Na
+prática, uma fila cheia sai de ~11 kB para ~5 kB.
 
 ### Privacidade GM × Player
 
@@ -178,21 +196,79 @@ Além disso, `handleReset`, `openEndDialog`, `handleEndCombat` e todas as açõe
 de CA passam por `requireGM()` antes de escrever qualquer coisa, cobrindo o caso
 de um papel rebaixado no meio da sessão.
 
-### Lançamento duplo de dano
+### Lançamento de dano em área
 
-Uma única ação incrementa `damageDealt` do atacante **e** `damageTanked` da
-vítima, numa só escrita na metadata. Qualquer um dos dois lados pode ser
+Uma única ação incrementa `damageDealt` do atacante **e** as estatísticas de
+**todos os alvos**, numa só escrita na metadata — é assim que dano em área
+funciona: uma rolagem, várias vítimas. Qualquer um dos dois lados pode ser
 omitido (dano ambiental, queda, dano em si próprio).
 
+Cada alvo da lista carrega suas próprias marcações, porque numa bola de fogo o
+elemental do fogo resiste, o ladino esquiva e o clérigo come tudo:
+
+| Marcação | Efeito |
+| --- | --- |
+| **½ Resist.** | recebe metade (arredondando para baixo); o resto vai para `damageMitigated` |
+| **💨 Errou** | não recebe nada; o golpe evitado vira `damageDodged` + 1 em `misses` |
+| _(nenhuma)_ | recebe o valor cheio |
+
+As marcações são **por lançamento**, e não uma propriedade fixa do combatente —
+resistência em RPG é por tipo de dano, e errar é um evento daquele ataque. A
+lista mostra a prévia já calculada (`50 → 25`) antes de confirmar.
+
+O atacante é creditado pelo dano que **realmente encostou**, somado entre os
+alvos: mitigado e esquivado não contam como dano causado. Sem nenhum alvo na
+lista, o valor cheio é creditado.
+
 Valores negativos são aceitos como correção — os contadores nunca passam de 0
-para baixo.
+para baixo, e uma correção nunca inventa um golpe novo na contagem de
+`hitsTaken`/`misses`. Como a metade preserva o sinal, lançar `+51` resistido e
+depois `-51` resistido volta exatamente a zero.
+
+Cura segue a mesma lista de alvos: cada um recebe o valor cheio e o curandeiro
+soma todos.
+
+### O paredão: o que você levou e o que você anulou
+
+A aba **🛡️ Tank** desenha duas barras na mesma escala. A sólida é o dano que
+encostou; a hachurada, encostada no fim dela, é o que a resistência cortou antes
+de chegar na vida. Juntas mostram a **ameaça inteira** que veio na direção
+daquele combatente — e a legenda embaixo da tabela diz qual é qual.
+
+A ordenação continua pelo dano recebido de fato (a coluna da direita), então a
+barra sólida cai linha a linha acompanhando a tabela. Abaixo do nome, os números
+por extenso: recebido, mitigado, esquivas (`3 esquivas de 11`) e dano evitado.
+
+Quem **só** esquivou aparece na tabela mesmo com `damageTanked` zerado. Ele foi
+alvo, e sair ileso é justamente o mérito — sumir da lista seria punir o
+resultado bom.
+
+### Como o MVP é decidido
+
+O relatório final traz quatro troféus de categoria (dano, tank, evasão, cura) e
+um **índice de contribuição de 0 a 100** que elege o MVP da batalha. O índice
+mede cinco pilares — ofensiva, muralha, evasão, suporte e eficiência — cada um
+como nota relativa ao melhor da mesa.
+
+Duas decisões de projeto que valem destacar:
+
+- **Pilar em que ninguém pontuou sai da conta**, e seu peso é redistribuído. É o
+  que resolve o "nem todo grupo tem curandeiro": numa mesa sem cura, ninguém
+  carrega pontos mortos que jamais poderia ganhar.
+- **Muralha e Eficiência se contradizem de propósito.** Um premia aguentar a
+  pancada pelo grupo, o outro premia bater sem apanhar. São dois jeitos legítimos
+  de jogar bem, e cada um tem seu caminho até o topo.
+
+A regra completa, com exemplo numérico fechado, está em
+[`docs/pontuacao-mvp.md`](docs/pontuacao-mvp.md).
 
 ### Menu de contexto
 
 Clique direito num token da camada `CHARACTER`:
 
-- **⚔️ Adicionar Dano ao Token** — grava o token como alvo pendente e abre o
-  painel com a vítima já selecionada.
+- **⚔️ Adicionar Dano ao Token** — grava o token como alvo pendente, abre o
+  painel e já escancara o diálogo de ataque com ele como primeiro alvo. Se o
+  golpe for em área, os outros alvos entram pelo seletor.
 - **➕ Adicionar à Iniciativa** _(só mestre)_ — entra no combate com iniciativa
   10, ajustável pelo ✏️ no card.
 

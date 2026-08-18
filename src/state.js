@@ -29,8 +29,22 @@ export const PENDING_TARGET_KEY = `${ID}/pending-target`;
  */
 export const CHANNEL_BATTLE_REPORT = `${ID}/battle-report`;
 
-const MAX_COMBATANTS = 60;
+/**
+ * Teto de combatentes gravados.
+ *
+ * A conta: a metadata da SALA tem 16 kB no total — e esse teto e compartilhado
+ * com qualquer outra extensao instalada. Um combatente com a ficha inteira
+ * preenchida (sete contadores, vida e CA) ocupa ~300 bytes ja compactado, entao
+ * 45 fecham em ~13 kB no pior caso e deixam folga para os vizinhos. Uma fila de
+ * iniciativa maior que isso tambem nao se le num painel de 420px.
+ */
+const MAX_COMBATANTS = 45;
 const MAX_NAME_LENGTH = 40;
+
+/** Quantos combatentes ainda cabem na fila. */
+export function remainingSlots(state) {
+  return Math.max(0, MAX_COMBATANTS - state.combatants.length);
+}
 
 /** @returns {{round: number, activeTokenId: string|null, combatants: Array}} */
 export function createEmptyState() {
@@ -63,12 +77,54 @@ export function normalizeState(raw) {
         initiative: toFiniteNumber(c.initiative, 0),
         damageDealt: Math.max(0, Math.round(toFiniteNumber(c.damageDealt, 0))),
         damageTanked: Math.max(0, Math.round(toFiniteNumber(c.damageTanked, 0))),
+        damageMitigated: Math.max(0, Math.round(toFiniteNumber(c.damageMitigated, 0))),
+        damageDodged: Math.max(0, Math.round(toFiniteNumber(c.damageDodged, 0))),
+        misses: Math.max(0, Math.round(toFiniteNumber(c.misses, 0))),
+        hitsTaken: Math.max(0, Math.round(toFiniteNumber(c.hitsTaken, 0))),
         healingDone: Math.max(0, Math.round(toFiniteNumber(c.healingDone, 0))),
         isGMOnly: Boolean(c.isGMOnly),
         hp: normalizeHp(c.hp),
         ac: normalizeAc(c.ac),
       })),
   };
+}
+
+/** Contadores que nascem em zero — a base da compactacao antes de gravar. */
+const COUNTER_KEYS = [
+  "damageDealt",
+  "damageTanked",
+  "damageMitigated",
+  "damageDodged",
+  "misses",
+  "hitsTaken",
+  "healingDone",
+];
+
+/**
+ * Enxuga o combatente para gravacao: contadores zerados, `isGMOnly: false`,
+ * `hp: null` e `ac: null` simplesmente nao vao para a metadata — `normalizeState`
+ * os reconstroi na leitura com exatamente os mesmos valores.
+ *
+ * Isso importa porque a metadata da sala tem teto de 16kB e a ficha cresceu
+ * (dano mitigado, esquivado, erros, golpes recebidos). Um combatente recem
+ * adicionado ocupa ~70 bytes em vez de ~300.
+ */
+function compactCombatant(combatant) {
+  const compact = {
+    id: combatant.id,
+    name: combatant.name,
+    initiative: combatant.initiative,
+  };
+
+  for (const key of COUNTER_KEYS) {
+    if (combatant[key]) compact[key] = combatant[key];
+  }
+
+  if (combatant.isGMOnly) compact.isGMOnly = true;
+  if (combatant.hp) compact.hp = combatant.hp;
+  if (combatant.ac) compact.ac = combatant.ac;
+
+  return compact;
 }
 
 /**
@@ -113,6 +169,10 @@ export function createCombatant(id, name, initiative, isGMOnly = false) {
     initiative,
     damageDealt: 0,
     damageTanked: 0,
+    damageMitigated: 0,
+    damageDodged: 0,
+    misses: 0,
+    hitsTaken: 0,
     healingDone: 0,
     isGMOnly,
     hp: null,
@@ -126,8 +186,16 @@ export async function readState() {
 }
 
 export async function writeState(state) {
+  const normalized = normalizeState(state);
+
   // setMetadata faz spread com o que ja existe, entao so a nossa chave e tocada.
-  await OBR.room.setMetadata({ [METADATA_KEY]: normalizeState(state) });
+  await OBR.room.setMetadata({
+    [METADATA_KEY]: {
+      round: normalized.round,
+      activeTokenId: normalized.activeTokenId,
+      combatants: normalized.combatants.map(compactCombatant),
+    },
+  });
 }
 
 /**
@@ -251,6 +319,30 @@ export function sortByDamageTanked(combatants) {
   );
 }
 
+/**
+ * Ameaca total dirigida a um combatente: o que encostou, o que a resistencia
+ * cortou e o que a esquiva evitou. E a medida de "quanto perigo veio na sua
+ * direcao", independente de quanto voce aguentou.
+ */
+export function damageFaced(combatant) {
+  return combatant.damageTanked + combatant.damageMitigated + combatant.damageDodged;
+}
+
+/** Dano que o combatente anulou — o oposto do que ele levou no corpo. */
+export function damageNullified(combatant) {
+  return combatant.damageMitigated + combatant.damageDodged;
+}
+
+/** Ranking defensivo: quem mais anulou golpes, desempatado pelo numero de esquivas. */
+export function sortByEvasion(combatants) {
+  return [...combatants].sort(
+    (a, b) =>
+      b.misses - a.misses ||
+      damageNullified(b) - damageNullified(a) ||
+      a.name.localeCompare(b.name, "pt-BR"),
+  );
+}
+
 export function sortByHealing(combatants) {
   return [...combatants].sort(
     (a, b) => b.healingDone - a.healingDone || a.name.localeCompare(b.name, "pt-BR"),
@@ -297,25 +389,101 @@ export function advanceTurn(state) {
 }
 
 /**
- * Lancamento duplo de dano: credita damageDealt no atacante e damageTanked na
- * vitima na mesma escrita. Atacante e vitima podem ser o mesmo combatente
- * (dano em si proprio) e qualquer um dos dois pode ser omitido.
- *
- * @param {number} amount valor positivo (dano) ou negativo (correcao/cura)
+ * Metade arredondada para baixo, preservando o sinal. Resistencia em RPG corta
+ * o dano pela metade arredondando para baixo (51 vira 25), e manter o sinal faz
+ * a correcao ser exata: lancar +51 resistido e depois -51 resistido volta a zero.
  */
-export function applyDamage(state, attackerId, victimId, amount) {
+function halve(value) {
+  return Math.sign(value) * Math.floor(Math.abs(value) / 2);
+}
+
+/**
+ * Calcula o resultado de um lancamento SEM tocar no estado. E a unica fonte da
+ * verdade das regras de resistencia e esquiva: o dialogo usa para mostrar a
+ * previa ("50 → 25") e `applyAttack` usa para gravar. Se as duas contas fossem
+ * separadas, a previa e o placar poderiam discordar.
+ *
+ * @param {Array<{id: string, resistant?: boolean, missed?: boolean}>} targets
+ * @param {number} amount dano bruto rolado, igual para todos os alvos
+ */
+export function previewAttack(targets, amount) {
   const value = Math.round(toFiniteNumber(amount, 0));
-  if (value === 0) return state;
+
+  const perTarget = (Array.isArray(targets) ? targets : []).map((target) => {
+    // Esquivou: o golpe nao encosta. O valor rolado vira "dano evitado", que e
+    // o que da lastro estatistico a esquiva.
+    if (target.missed) {
+      return {
+        id: target.id,
+        landed: 0,
+        mitigated: 0,
+        dodged: Math.max(0, value),
+        missed: true,
+      };
+    }
+
+    const landed = target.resistant ? halve(value) : value;
+    return { id: target.id, landed, mitigated: value - landed, dodged: 0, missed: false };
+  });
+
+  return {
+    value,
+    perTarget,
+    dealt: perTarget.reduce((sum, t) => sum + t.landed, 0),
+    mitigated: perTarget.reduce((sum, t) => sum + t.mitigated, 0),
+    dodged: perTarget.reduce((sum, t) => sum + t.dodged, 0),
+    misses: perTarget.filter((t) => t.missed).length,
+  };
+}
+
+/**
+ * Lancamento de dano em lote: credita damageDealt no atacante e distribui o
+ * golpe entre TODOS os alvos numa unica escrita — e assim que dano em area
+ * funciona (uma bola de fogo acerta cinco criaturas com a mesma rolagem).
+ *
+ * Cada alvo carrega suas proprias marcacoes:
+ *   - `resistant`: recebe metade (o resto entra em damageMitigated)
+ *   - `missed`: nao recebe nada; o golpe evitado entra em damageDodged/misses
+ *
+ * O atacante e creditado pelo dano que REALMENTE encostou, somado entre os
+ * alvos: mitigado e esquivado nao contam como dano causado. Sem nenhum alvo, o
+ * valor cheio e creditado (dano registrado so pelo lado de quem bateu).
+ *
+ * @param {number} amount valor positivo (dano) ou negativo (correcao)
+ */
+export function applyAttack(state, attackerId, targets, amount) {
+  const list = Array.isArray(targets) ? targets : [];
+  const result = previewAttack(list, amount);
+  if (result.value === 0) return state;
+
+  // Valor negativo e correcao de um lancamento errado: desfaz o dano, mas nao
+  // pode inventar um ataque novo na contagem de golpes recebidos/esquivados.
+  const isNewAttack = result.value > 0;
+
+  for (const outcome of result.perTarget) {
+    const victim = state.combatants.find((c) => c.id === outcome.id);
+    if (!victim) continue;
+
+    if (outcome.missed) {
+      victim.damageDodged = Math.max(0, victim.damageDodged + outcome.dodged);
+      if (isNewAttack) victim.misses += 1;
+      continue;
+    }
+
+    victim.damageTanked = Math.max(0, victim.damageTanked + outcome.landed);
+    victim.damageMitigated = Math.max(0, victim.damageMitigated + outcome.mitigated);
+    if (isNewAttack) victim.hitsTaken += 1;
+
+    // Quem tem vida monitorada perde pontos no mesmo lançamento — só o que passou.
+    if (victim.hp) {
+      victim.hp.current = clampHp(victim.hp.current - outcome.landed, victim.hp.max);
+    }
+  }
 
   const attacker = state.combatants.find((c) => c.id === attackerId);
-  const victim = state.combatants.find((c) => c.id === victimId);
-
-  if (attacker) attacker.damageDealt = Math.max(0, attacker.damageDealt + value);
-
-  if (victim) {
-    victim.damageTanked = Math.max(0, victim.damageTanked + value);
-    // Quem tem vida monitorada perde pontos no mesmo lançamento.
-    if (victim.hp) victim.hp.current = clampHp(victim.hp.current - value, victim.hp.max);
+  if (attacker) {
+    const credit = list.length === 0 ? result.value : result.dealt;
+    attacker.damageDealt = Math.max(0, attacker.damageDealt + credit);
   }
 
   return state;
@@ -326,19 +494,34 @@ function clampHp(value, max) {
 }
 
 /**
- * Registra cura. So o curandeiro pontua (healingDone); o alvo nao acumula nada,
- * porque "vida recebida" nao e merito de quem levou o feitico.
+ * Registra cura, tambem em lote — cura em area devolve o mesmo valor a cada
+ * alvo. So o curandeiro pontua (healingDone, somando todos os alvos); quem
+ * recebeu nao acumula nada, porque "vida recebida" nao e merito de quem levou
+ * o feitico.
+ *
+ * @param {string[]} targetIds pode vir vazio (cura registrada sem alvo)
  */
-export function applyHealing(state, healerId, targetId, amount) {
+export function applyHealing(state, healerId, targetIds, amount) {
   const value = Math.round(toFiniteNumber(amount, 0));
   if (value === 0) return state;
 
-  const healer = state.combatants.find((c) => c.id === healerId);
-  if (healer) healer.healingDone = Math.max(0, healer.healingDone + value);
+  const ids = Array.isArray(targetIds) ? targetIds : targetIds ? [targetIds] : [];
 
-  // O alvo nao ganha merito, mas recupera vida se estiver sendo monitorado.
-  const target = state.combatants.find((c) => c.id === targetId);
-  if (target?.hp) target.hp.current = clampHp(target.hp.current + value, target.hp.max);
+  let healed = 0;
+  for (const id of ids) {
+    const target = state.combatants.find((c) => c.id === id);
+    if (!target) continue;
+
+    healed += value;
+    // O alvo nao ganha merito, mas recupera vida se estiver sendo monitorado.
+    if (target.hp) target.hp.current = clampHp(target.hp.current + value, target.hp.max);
+  }
+
+  const healer = state.combatants.find((c) => c.id === healerId);
+  if (healer) {
+    const credit = ids.length === 0 ? value : healed;
+    healer.healingDone = Math.max(0, healer.healingDone + credit);
+  }
 
   return state;
 }
@@ -471,9 +654,7 @@ export function resetCombat(state) {
   state.round = 1;
   state.activeTokenId = null;
   for (const combatant of state.combatants) {
-    combatant.damageDealt = 0;
-    combatant.damageTanked = 0;
-    combatant.healingDone = 0;
+    for (const key of COUNTER_KEYS) combatant[key] = 0;
     if (combatant.hp) combatant.hp.current = combatant.hp.max;
   }
   return state;
@@ -496,71 +677,171 @@ export function endCombat(state) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Pontos por posicao no podio de UMA categoria. Fora do top 3, zero.
- * Ver docs/pontuacao-mvp.md para a explicacao completa.
+ * Os cinco pilares do Indice de Contribuicao, com o peso de cada um. Os pesos
+ * somam 100, entao o indice ja nasce numa escala de 0 a 100: 100 seria ser o
+ * melhor da mesa em TODOS os pilares ao mesmo tempo.
+ *
+ * A explicacao completa (com exemplo numerico) esta em docs/pontuacao-mvp.md.
  */
-export const PODIUM_POINTS = [5, 3, 1];
-
-/**
- * Peso de cada categoria. Dano vale mais, tank vem em seguida, cura fecha como
- * ponto de utilidade.
- */
-export const CATEGORY_WEIGHTS = [
-  { key: "damageDealt", weight: 3, label: "Dano", icon: "⚔️" },
-  { key: "damageTanked", weight: 2, label: "Tank", icon: "🛡️" },
-  { key: "healingDone", weight: 1, label: "Cura", icon: "💚" },
+export const MVP_PILLARS = [
+  {
+    key: "offense",
+    weight: 30,
+    icon: "⚔️",
+    label: "Ofensiva",
+    hint: "dano que realmente encostou no inimigo",
+  },
+  {
+    key: "wall",
+    weight: 20,
+    icon: "🛡️",
+    label: "Muralha",
+    hint: "dano absorvido no proprio corpo",
+  },
+  {
+    key: "evasion",
+    weight: 20,
+    icon: "💨",
+    label: "Evasão",
+    hint: "dano anulado por esquiva e resistência",
+  },
+  {
+    key: "support",
+    weight: 15,
+    icon: "💚",
+    label: "Suporte",
+    hint: "vida devolvida ao grupo",
+  },
+  {
+    key: "efficiency",
+    weight: 15,
+    icon: "♟️",
+    label: "Eficiência",
+    hint: "bateu muito sem apanhar na mesma medida",
+  },
 ];
 
 /**
- * Calcula a pontuacao de MVP de cada combatente.
+ * Dentro do pilar de Evasao, quanto vale o DANO anulado contra a QUANTIDADE de
+ * golpes evitados.
  *
- * Para cada categoria montamos um podio (so quem tem valor > 0 entra) e damos
- * 5/3/1 ponto ao 1o/2o/3o. Esse ponto e multiplicado pelo peso da categoria e
- * tudo e somado. Maximo teorico: 3x5 + 2x5 + 1x5 = 30.
- *
- * O desempate final e por dano bruto, depois tank, depois cura — assim dois
- * empates de podio nunca ficam em ordem aleatoria.
- *
- * @returns lista ordenada do maior para o menor score, com o detalhamento
- *          usado no relatorio de batalha.
+ * Os dois existem porque nem toda mesa anota a rolagem de um ataque que errou.
+ * Se so contassemos dano evitado, o mestre que digita 0 num miss zeraria a
+ * esquiva do jogador; se so contassemos a quantidade, esquivar de um tapinha
+ * valeria igual a esquivar de uma bola de fogo.
  */
-export function computeMvpRanking(combatants) {
-  const scores = new Map(
-    combatants.map((c) => [c.id, { combatant: c, score: 0, breakdown: [] }]),
+export const EVASION_DAMAGE_SHARE = 0.7;
+
+/**
+ * Converte uma lista de valores brutos em notas de 0 a 1, comparadas ao melhor
+ * da mesa. E o que torna o indice justo em qualquer escala de campanha: o que
+ * conta e o desempenho RELATIVO, nao o numero absoluto de dano.
+ */
+function shareOfMax(values) {
+  const max = Math.max(0, ...values);
+  return max > 0 ? values.map((v) => Math.max(0, v) / max) : values.map(() => 0);
+}
+
+/**
+ * Valor bruto de cada pilar, na mesma ordem da lista de combatentes recebida.
+ *
+ * Note que nada aqui se sobrepoe: o dano que encostou alimenta a Muralha, o
+ * dano que NAO encostou alimenta a Evasao. Somados, dao a ameaca total dirigida
+ * aquele combatente — cada ponto de dano e contado uma vez so.
+ */
+function pillarValues(list) {
+  const offense = list.map((c) => c.damageDealt);
+  const wall = list.map((c) => c.damageTanked);
+  const support = list.map((c) => c.healingDone);
+
+  // Evasao: mistura de "quanto dano voce anulou" com "quantos golpes voce evitou".
+  const nullifiedShare = shareOfMax(list.map(damageNullified));
+  const dodgeShare = shareOfMax(list.map((c) => c.misses));
+  const evasion = list.map(
+    (_, i) =>
+      EVASION_DAMAGE_SHARE * nullifiedShare[i] + (1 - EVASION_DAMAGE_SHARE) * dodgeShare[i],
   );
 
-  for (const category of CATEGORY_WEIGHTS) {
-    const podium = [...combatants]
-      .filter((c) => c[category.key] > 0)
-      .sort(
-        (a, b) =>
-          b[category.key] - a[category.key] || a.name.localeCompare(b.name, "pt-BR"),
-      )
-      .slice(0, PODIUM_POINTS.length);
+  // Eficiencia: a qualidade da troca (quanto do dano da sua briga foi VOCE
+  // batendo) multiplicada pelo volume de dano causado. O volume e o pedagio
+  // contra o carona: quem causou 5 de dano e nao apanhou tem troca perfeita,
+  // mas ponderada por um volume quase zero — nao vira MVP por ter ficado atras.
+  const offenseShare = shareOfMax(offense);
+  const efficiency = list.map((c, i) => {
+    const traded = c.damageDealt + c.damageTanked;
+    return traded > 0 ? (c.damageDealt / traded) * offenseShare[i] : 0;
+  });
 
-    podium.forEach((combatant, index) => {
-      const points = PODIUM_POINTS[index] * category.weight;
-      const entry = scores.get(combatant.id);
-      if (!entry) return;
+  return { offense, wall, evasion, support, efficiency };
+}
 
-      entry.score += points;
-      entry.breakdown.push({
-        ...category,
-        position: index + 1,
-        value: combatant[category.key],
-        points,
-      });
-    });
+/**
+ * Calcula o Indice de Contribuicao (0 a 100) de cada combatente.
+ *
+ * 1. Cada pilar vira uma nota de 0 a 1 comparada ao melhor da mesa.
+ * 2. Pilares sem NENHUM registro na batalha saem da conta e seu peso e
+ *    redistribuido entre os demais. E o que resolve o "nem todo grupo tem
+ *    curandeiro": numa mesa sem cura, ninguem carrega 15 pontos mortos.
+ * 3. Nota x peso efetivo, somado = o indice.
+ *
+ * @returns {{ranking: Array, pillars: Array}} ranking ordenado do maior para o
+ *          menor indice, e os pilares que efetivamente valeram nesta batalha
+ *          (com o peso ja redistribuido) para a UI conseguir explicar a conta.
+ */
+export function computeMvpRanking(combatants) {
+  const list = [...combatants];
+  if (list.length === 0) return { ranking: [], pillars: [] };
+
+  const raw = pillarValues(list);
+
+  // Um pilar so entra na conta se alguem pontuou nele nesta batalha.
+  const active = MVP_PILLARS.filter((pillar) => Math.max(0, ...raw[pillar.key]) > 0);
+  const totalWeight = active.reduce((sum, pillar) => sum + pillar.weight, 0);
+
+  if (totalWeight === 0) {
+    return {
+      ranking: list.map((combatant) => ({ combatant, score: 0, breakdown: [] })),
+      pillars: [],
+    };
   }
 
-  return [...scores.values()].sort(
+  // Peso efetivo: os pesos dos pilares ativos reescalados para somar 100.
+  const pillars = active.map((pillar) => ({
+    ...pillar,
+    effectiveWeight: (pillar.weight / totalWeight) * 100,
+  }));
+
+  const shares = new Map(pillars.map((pillar) => [pillar.key, shareOfMax(raw[pillar.key])]));
+
+  const ranking = list.map((combatant, index) => {
+    const breakdown = [];
+    let score = 0;
+
+    for (const pillar of pillars) {
+      const share = shares.get(pillar.key)[index];
+      if (share <= 0) continue;
+
+      const points = share * pillar.effectiveWeight;
+      score += points;
+      breakdown.push({ ...pillar, share, points, raw: raw[pillar.key][index] });
+    }
+
+    // O detalhamento aparece do pilar que mais rendeu para o que menos rendeu.
+    breakdown.sort((a, b) => b.points - a.points);
+
+    return { combatant, score, breakdown };
+  });
+
+  ranking.sort(
     (a, b) =>
       b.score - a.score ||
       b.combatant.damageDealt - a.combatant.damageDealt ||
-      b.combatant.damageTanked - a.combatant.damageTanked ||
+      damageFaced(b.combatant) - damageFaced(a.combatant) ||
       b.combatant.healingDone - a.combatant.healingDone ||
       a.combatant.name.localeCompare(b.combatant.name, "pt-BR"),
   );
+
+  return { ranking, pillars };
 }
 
 /* -------------------------------------------------------------------------- */

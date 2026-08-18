@@ -276,6 +276,13 @@
       .stat-heal {
         color: var(--success);
       }
+      /* Só aparecem quando há o que mostrar, para não poluir o card. */
+      .stat-mitigated {
+        color: #8fc4f0;
+      }
+      .stat-miss {
+        color: var(--gold);
+      }
 
       /* Alternador dano / cura dentro do diálogo -------------------------- */
       .mode-switch {
@@ -481,6 +488,69 @@
         position: relative;
       }
 
+      /* Barra dupla do paredão: recebido (sólido) + mitigado (hachurado),
+         lado a lado na mesma escala. Ver as duas juntas é o que mostra quanto
+         perigo veio na direção do combatente e quanto dele foi cortado. */
+      .bar-stack {
+        position: absolute;
+        left: 0;
+        top: 3px;
+        bottom: 3px;
+        width: 100%;
+        display: flex;
+        pointer-events: none;
+      }
+      .bar-seg {
+        height: 100%;
+      }
+      .bar-seg.received {
+        background: rgba(77, 171, 247, 0.22);
+        border-radius: 3px 0 0 3px;
+      }
+      .bar-seg.mitigated {
+        border-radius: 0 3px 3px 0;
+        background: repeating-linear-gradient(
+          45deg,
+          rgba(77, 171, 247, 0.3) 0 3px,
+          rgba(77, 171, 247, 0.06) 3px 7px
+        );
+      }
+      /* Sem mitigação, o segmento sólido fecha as duas pontas. */
+      .bar-seg.received:last-child {
+        border-radius: 3px;
+      }
+
+      .bar-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 12px;
+        margin-top: 7px;
+        font-size: 10px;
+        color: var(--text-dim);
+      }
+      .bar-legend span {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .bar-legend .swatch {
+        width: 14px;
+        height: 9px;
+        border-radius: 3px;
+        border: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+      .bar-legend .swatch.received {
+        background: rgba(77, 171, 247, 0.35);
+      }
+      .bar-legend .swatch.mitigated {
+        background: repeating-linear-gradient(
+          45deg,
+          rgba(77, 171, 247, 0.45) 0 3px,
+          rgba(77, 171, 247, 0.08) 3px 7px
+        );
+      }
+
       /* ==================================================================== */
       /* Blocos de formulario                                                 */
       /* ==================================================================== */
@@ -567,6 +637,113 @@
         width: auto;
         accent-color: var(--accent);
         cursor: pointer;
+      }
+
+      /* ==================================================================== */
+      /* Lista de alvos do lançamento (dano/cura em área)                     */
+      /* ==================================================================== */
+      .target-list {
+        margin: -2px 0 9px;
+      }
+
+      .target-row {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--accent);
+        border-radius: 8px;
+        padding: 5px 6px 5px 8px;
+        margin-bottom: 4px;
+      }
+      /* Quem esquivou fica apagado: o golpe não encostou nele. */
+      .target-row.is-missed {
+        border-left-color: var(--gold);
+        opacity: 0.75;
+      }
+
+      .target-name {
+        flex: 1;
+        min-width: 0;
+        font-weight: 600;
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* Prévia do golpe naquele alvo — "50 → 25" deixa a resistência óbvia. */
+      .target-hit {
+        font-size: 11px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        color: var(--accent);
+        flex-shrink: 0;
+      }
+      .target-hit.cut {
+        color: #8fc4f0;
+      }
+      .target-hit.missed {
+        color: var(--gold);
+        text-transform: uppercase;
+        font-size: 9.5px;
+        letter-spacing: 0.6px;
+      }
+      .target-hit.heal {
+        color: var(--success);
+      }
+
+      .target-flag {
+        background: #100c0b;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 4px 6px;
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--text-dim);
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .target-flag:hover {
+        color: var(--text);
+        border-color: var(--shield);
+      }
+      .target-flag.on {
+        background: rgba(77, 171, 247, 0.16);
+        border-color: var(--shield);
+        color: var(--shield);
+      }
+      .target-flag.miss:hover {
+        border-color: var(--gold);
+      }
+      .target-flag.miss.on {
+        background: rgba(255, 201, 60, 0.16);
+        border-color: var(--gold);
+        color: var(--gold);
+      }
+
+      .target-remove {
+        background: none;
+        border: none;
+        font-size: 10px;
+        opacity: 0.55;
+        padding: 2px;
+        flex-shrink: 0;
+      }
+      .target-remove:hover {
+        opacity: 1;
+      }
+
+      .target-empty {
+        border: 1px dashed var(--border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-size: 10.5px;
+        line-height: 1.5;
+        color: var(--text-dim);
+        text-align: center;
       }
 
       .quick-damage {
@@ -1001,6 +1178,15 @@
         color: var(--shield);
       }
 
+      .mvp-card.evasion {
+        border-left-color: var(--gold);
+        background: linear-gradient(90deg, rgba(255, 201, 60, 0.12), var(--bg-card) 60%);
+      }
+      .mvp-card.evasion .mvp-value,
+      .mvp-card.evasion .mvp-label {
+        color: var(--gold);
+      }
+
       .mvp-card.heal {
         border-left-color: var(--success);
         background: linear-gradient(90deg, rgba(81, 207, 102, 0.13), var(--bg-card) 60%);
@@ -1008,6 +1194,39 @@
       .mvp-card.heal .mvp-value,
       .mvp-card.heal .mvp-label {
         color: var(--success);
+      }
+
+      /* Faixa do MVP geral — o único card dourado do relatório. */
+      .mvp-banner {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        background: linear-gradient(90deg, rgba(255, 201, 60, 0.18), var(--bg-card) 70%);
+        border: 1px solid rgba(255, 201, 60, 0.45);
+        border-left: 3px solid var(--gold);
+        border-radius: var(--radius);
+        padding: 12px;
+        box-shadow: 0 0 22px rgba(255, 201, 60, 0.12);
+      }
+      .mvp-crown {
+        font-size: 28px;
+        line-height: 1;
+        flex-shrink: 0;
+      }
+      .mvp-banner .mvp-name {
+        font-size: 17px;
+        color: var(--gold);
+      }
+      .mvp-banner .mvp-value {
+        color: var(--gold);
+      }
+      .mvp-why {
+        font-size: 10px;
+        color: var(--text-dim);
+        margin-top: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
 
       .mvp-card.vacant {
@@ -1042,13 +1261,15 @@
         margin-bottom: 7px;
       }
 
+      /* Seis números-resumo em 3x2: em 420px de largura, uma fileira só
+         espremeria cada um a menos de 60px. */
       .report-totals {
-        display: flex;
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
         gap: 6px;
         margin-top: 14px;
       }
       .total-tile {
-        flex: 1;
         background: var(--bg-card);
         border: 1px solid var(--border);
         border-radius: 8px;
@@ -1215,10 +1436,14 @@
 
           <div class="arrow-down" id="arrow-label">↓ causou dano em ↓</div>
 
+          <!-- Vários alvos: dano e cura em área usam a mesma rolagem para todos.
+               O seletor ADICIONA à lista abaixo e volta ao placeholder. -->
           <div class="field">
             <label for="select-victim" id="label-victim">Quem levou</label>
             <select id="select-victim"></select>
           </div>
+
+          <div class="target-list" id="target-list"></div>
 
           <div class="field">
             <label for="input-damage" id="label-amount">Dano</label>
@@ -1234,14 +1459,17 @@
           </div>
 
           <p class="dialog-hint" id="hint-damage">
-            Some no <b>dano causado</b> do atacante e no <b>dano tankado</b> da vítima.
-            Deixe um dos lados vazio para dano ambiental. Valor negativo corrige um
+            A mesma rolagem vale para <b>todos os alvos</b> da lista. Marque
+            <b>½ Resist.</b> em quem tem resistência (recebe metade) e <b>💨 Errou</b>
+            em quem esquivou (não recebe nada, e a esquiva conta a favor dele).
+            Sem nenhum alvo, o dano é ambiental. Valor negativo corrige um
             lançamento errado.
           </p>
 
           <p class="dialog-hint" id="hint-heal" hidden>
-            Some no <b>total de cura</b> de quem curou. O alvo serve só de registro —
-            vida recebida não conta como mérito de quem levou o feitiço.
+            Some no <b>total de cura</b> de quem curou — cada alvo da lista recebe o
+            valor cheio. Os alvos servem só de registro: vida recebida não conta como
+            mérito de quem levou o feitiço.
           </p>
         </div>
 
